@@ -24,12 +24,10 @@ func (w *MCPToolWrapper) Info() fantasy.ToolInfo {
 	var req []string
 
 	// Map MCP Schema exactly to what Fantasy ToolInfo expects.
-	// Fantasy's Parameters field expects the inner `properties` map of the schema.
 	if len(w.mcpTool.InputSchema.Properties) > 0 {
 		props = w.mcpTool.InputSchema.Properties
 		req = w.mcpTool.InputSchema.Required
 	} else if len(w.mcpTool.RawInputSchema) > 0 {
-		// Fallback if the tool only provided a raw schema
 		var raw map[string]any
 		if err := json.Unmarshal(w.mcpTool.RawInputSchema, &raw); err == nil {
 			if p, ok := raw["properties"].(map[string]any); ok {
@@ -60,7 +58,6 @@ func (w *MCPToolWrapper) Info() fantasy.ToolInfo {
 func (w *MCPToolWrapper) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 	var args map[string]any
 
-	// If the LLM didn't pass any arguments, it might pass an empty string
 	input := strings.TrimSpace(call.Input)
 	if input == "" {
 		input = "{}"
@@ -117,10 +114,13 @@ func NewMCPManager(servers []MCPServerConfig) *MCPManager {
 	ctx := context.Background()
 
 	for _, srv := range servers {
+		mgr.enabled[srv.Name] = false
+	}
+
+	for _, srv := range servers {
 		var c *client.Client
 		var err error
 
-		// Default to stdio if type is not specified and command is present
 		srvType := srv.Type
 		if srvType == "" && srv.Command != "" {
 			srvType = "stdio"
@@ -135,18 +135,21 @@ func NewMCPManager(servers []MCPServerConfig) *MCPManager {
 				err = c.Start(ctx)
 			}
 		default:
-			continue // Skip servers with unsupported type
+			continue
 		}
 
 		if err != nil {
-			continue // Skip failing servers
+			fmt.Printf("Failed to create client for %s: %v\n", srv.Name, err)
+			continue
 		}
 
 		initReq := mcp.InitializeRequest{}
 		initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 		initReq.Params.ClientInfo = mcp.Implementation{Name: "prmtr", Version: "1.0.0"}
 
-		if _, err := c.Initialize(ctx, initReq); err == nil {
+		if _, err := c.Initialize(ctx, initReq); err != nil {
+			fmt.Printf("Failed to initialize %s: %v\n", srv.Name, err)
+		} else {
 			mgr.clients[srv.Name] = c
 			mgr.enabled[srv.Name] = true
 		}

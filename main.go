@@ -60,9 +60,9 @@ func saveConfig(path string, cfg *Config) error {
 }
 
 func main() {
-	cfg, err := loadConfig("config.yaml")
+	cfg, err := loadConfig("prmptr.yaml")
 	if err != nil {
-		fmt.Printf("Failed to load config: %v\n", err)
+		fmt.Printf("Failed to load config (prmptr.yaml): %v\n", err)
 		os.Exit(1)
 	}
 

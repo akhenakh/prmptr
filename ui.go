@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/fantasy"
@@ -16,9 +18,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// -------------------------------------------------------------------------
 // TUI State & Message Definitions
-// -------------------------------------------------------------------------
 
 type AppState int
 
@@ -32,8 +32,8 @@ const (
 )
 
 type llmResponseMsg struct {
-	text string
-	err  error
+	result *fantasy.AgentResult
+	err    error
 }
 
 type editorFinishedMsg struct {
@@ -58,15 +58,20 @@ type appModel struct {
 	state     AppState
 	isLoading bool
 
-	// Current Input
-	input     string
-	newPrompt string
+	// Advanced Text Input
+	input     []rune
+	cursorIdx int
+	newPrompt []rune
 
 	// Session History & Navigation
 	history       []interaction
 	promptHistory []string
 	historyIdx    int
-	scrollOffset  int
+	scrollOffset  int // 0 is bottom, >0 is scrolled up
+
+	// Cancellations & Hotkeys
+	cancelGen context.CancelFunc
+	lastEsc   time.Time
 
 	// Active Selections
 	activeModel string
@@ -83,8 +88,16 @@ func initialModel(cfg *Config) appModel {
 	if len(cfg.Models) > 0 {
 		activeMod = cfg.Models[0].Name
 	}
-	activeSys := "default"
-	if len(cfg.SystemPrompts) > 0 {
+
+	// Default prompt should be "default" if it exists, else the first one
+	activeSys := ""
+	for _, p := range cfg.SystemPrompts {
+		if p.Name == "default" {
+			activeSys = p.Name
+			break
+		}
+	}
+	if activeSys == "" && len(cfg.SystemPrompts) > 0 {
 		activeSys = cfg.SystemPrompts[0].Name
 	}
 
@@ -95,12 +108,11 @@ func initialModel(cfg *Config) appModel {
 		activeSys:   activeSys,
 		mcpManager:  NewMCPManager(cfg.MCPServers),
 		history:     make([]interaction, 0),
+		input:       make([]rune, 0),
 	}
 }
 
-// -------------------------------------------------------------------------
 // Bubble Tea v2 Lifecycle
-// -------------------------------------------------------------------------
 
 func (m appModel) Init() tea.Cmd {
 	return nil
@@ -114,41 +126,77 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case llmResponseMsg:
 		m.isLoading = false
-		content := msg.text
-		if msg.err != nil {
-			content = fmt.Sprintf("**Error:** %v", msg.err)
-		}
+		m.cancelGen = nil
+		m.scrollOffset = 0 // Auto-scroll to bottom
 
-		m.history = append(m.history, interaction{
-			Role:    "Assistant",
-			Content: content,
-		})
-		m.scrollOffset = 999999 // Auto-scroll to bottom
+		if msg.err != nil {
+			m.history = append(m.history, interaction{
+				Role:    "Assistant",
+				Content: fmt.Sprintf("**Error:** %v", msg.err),
+			})
+		} else if msg.result != nil {
+			m.history = append(m.history, interaction{
+				Role:    "Assistant",
+				Content: buildAssistantResponse(msg.result),
+			})
+		}
 
 	case editorFinishedMsg:
 		if msg.err == nil {
 			content, _ := os.ReadFile(msg.file)
-			newPrompt := SystemPrompt{Name: msg.name, Content: string(content)}
-			m.config.SystemPrompts = append(m.config.SystemPrompts, newPrompt)
+			newPrmt := SystemPrompt{Name: msg.name, Content: string(content)}
+			m.config.SystemPrompts = append(m.config.SystemPrompts, newPrmt)
 			m.activeSys = msg.name
-			_ = saveConfig("config.yaml", m.config)
+			_ = saveConfig("prmptr.yaml", m.config)
 		}
 		os.Remove(msg.file)
 		m.state = StateNormal
 
+	// Pasting
+	case tea.PasteMsg:
+		if m.state == StateNormal {
+			runes := []rune(msg.Content)
+			m.input = append(m.input[:m.cursorIdx], append(runes, m.input[m.cursorIdx:]...)...)
+			m.cursorIdx += len(runes)
+		}
+
 	// Mouse Scrolling Support
 	case tea.MouseWheelMsg:
 		if m.state == StateNormal {
-			if msg.Button == tea.MouseWheelUp {
-				m.scrollOffset -= 3
-			} else if msg.Button == tea.MouseWheelDown {
-				m.scrollOffset += 3
+			switch msg.Button {
+			case tea.MouseWheelUp:
+				m.scrollOffset += 3 // Scroll up into history
+			case tea.MouseWheelDown:
+				m.scrollOffset -= 3 // Scroll down to latest
 			}
 		}
 
+	// Keyboard Support
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
+		}
+
+		if msg.String() == "esc" {
+			now := time.Now()
+			// Double ESC to cancel generation or clear input
+			if now.Sub(m.lastEsc) < 500*time.Millisecond {
+				if m.cancelGen != nil {
+					m.cancelGen()
+					m.cancelGen = nil
+					m.isLoading = false
+					m.history = append(m.history, interaction{
+						Role:    "Assistant",
+						Content: "*Cancelled by user.*",
+					})
+				}
+				m.input = []rune{}
+				m.cursorIdx = 0
+				m.scrollOffset = 0
+			}
+			m.state = StateNormal
+			m.lastEsc = now
+			return m, nil
 		}
 
 		// Don't process input if we are waiting for LLM
@@ -164,11 +212,8 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				"Select System Prompt",
 				"Add New Prompt",
 				"Manage MCP Servers",
+				"New Session",
 			}
-			return m, nil
-		}
-		if msg.String() == "esc" {
-			m.state = StateNormal
 			return m, nil
 		}
 
@@ -176,64 +221,94 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case StateNormal:
 			switch msg.String() {
 			case "enter":
-				if strings.TrimSpace(m.input) != "" {
+				strInput := strings.TrimSpace(string(m.input))
+				if strInput != "" {
 					sysPrompt := m.getActiveSystemPrompt()
 					mcps := m.getActiveMCPs()
 
-					// Save to histories
-					m.promptHistory = append(m.promptHistory, m.input)
+					m.promptHistory = append(m.promptHistory, strInput)
 					m.historyIdx = len(m.promptHistory)
 
 					m.history = append(m.history, interaction{
 						Role:    "User",
-						Content: m.input,
+						Content: strInput,
 						System:  sysPrompt,
 						MCPs:    mcps,
 						Model:   m.activeModel,
 					})
 
-					promptStr := m.input
-					m.input = ""
+					m.input = []rune{}
+					m.cursorIdx = 0
 					m.isLoading = true
-					m.scrollOffset = 999999 // Auto-scroll to bottom
+					m.scrollOffset = 0 // Snap to bottom
 
-					cmd := m.requestLLM(promptStr, sysPrompt, mcps)
+					// Run LLM call with a cancelable context
+					ctx, cancel := context.WithCancel(context.Background())
+					m.cancelGen = cancel
+
+					cmd := m.requestLLM(ctx, strInput, sysPrompt, mcps)
 					return m, cmd
 				}
+			case "shift+enter", "alt+enter":
+				m.input = append(m.input[:m.cursorIdx], append([]rune{'\n'}, m.input[m.cursorIdx:]...)...)
+				m.cursorIdx++
 			case "backspace":
-				runes := []rune(m.input)
-				if len(runes) > 0 {
-					m.input = string(runes[:len(runes)-1])
+				if m.cursorIdx > 0 {
+					m.input = append(m.input[:m.cursorIdx-1], m.input[m.cursorIdx:]...)
+					m.cursorIdx--
 				}
-			case "space":
-				m.input += " "
+			case "delete":
+				if m.cursorIdx < len(m.input) {
+					m.input = append(m.input[:m.cursorIdx], m.input[m.cursorIdx+1:]...)
+				}
+			case "left":
+				if m.cursorIdx > 0 {
+					m.cursorIdx--
+				}
+			case "right":
+				if m.cursorIdx < len(m.input) {
+					m.cursorIdx++
+				}
 			case "up":
 				if m.historyIdx > 0 {
 					m.historyIdx--
-					m.input = m.promptHistory[m.historyIdx]
+					m.input = []rune(m.promptHistory[m.historyIdx])
+					m.cursorIdx = len(m.input)
 				}
 			case "down":
 				if m.historyIdx < len(m.promptHistory)-1 {
 					m.historyIdx++
-					m.input = m.promptHistory[m.historyIdx]
+					m.input = []rune(m.promptHistory[m.historyIdx])
+					m.cursorIdx = len(m.input)
 				} else if m.historyIdx == len(m.promptHistory)-1 {
 					m.historyIdx++
-					m.input = ""
+					m.input = []rune{}
+					m.cursorIdx = 0
 				}
+			case "ctrl+a", "home":
+				m.cursorIdx = 0
+			case "ctrl+e", "end":
+				m.cursorIdx = len(m.input)
 			case "pgup":
-				m.scrollOffset -= (m.height / 2)
-			case "pgdown":
 				m.scrollOffset += (m.height / 2)
+			case "pgdown":
+				m.scrollOffset -= (m.height / 2)
+			case "space":
+				m.input = append(m.input[:m.cursorIdx], append([]rune{' '}, m.input[m.cursorIdx:]...)...)
+				m.cursorIdx++
 			default:
 				if len(msg.Text) > 0 {
-					m.input += msg.Text
+					runes := []rune(msg.Text)
+					m.input = append(m.input[:m.cursorIdx], append(runes, m.input[m.cursorIdx:]...)...)
+					m.cursorIdx += len(runes)
 				}
 			}
 
 		case StatePromptNameInput:
 			switch msg.String() {
 			case "enter":
-				if len(m.newPrompt) > 0 {
+				nameStr := string(m.newPrompt)
+				if len(strings.TrimSpace(nameStr)) > 0 {
 					f, _ := os.CreateTemp("", "prmtr-*.md")
 					f.Close()
 
@@ -244,19 +319,18 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					c := exec.Command(editor, f.Name())
 					return m, tea.ExecProcess(c, func(err error) tea.Msg {
-						return editorFinishedMsg{err: err, file: f.Name(), name: m.newPrompt}
+						return editorFinishedMsg{err: err, file: f.Name(), name: nameStr}
 					})
 				}
 			case "backspace":
-				runes := []rune(m.newPrompt)
-				if len(runes) > 0 {
-					m.newPrompt = string(runes[:len(runes)-1])
+				if len(m.newPrompt) > 0 {
+					m.newPrompt = m.newPrompt[:len(m.newPrompt)-1]
 				}
 			case "space":
-				m.newPrompt += " "
+				m.newPrompt = append(m.newPrompt, ' ')
 			default:
 				if len(msg.Text) > 0 {
-					m.newPrompt += msg.Text
+					m.newPrompt = append(m.newPrompt, []rune(msg.Text)...)
 				}
 			}
 
@@ -282,15 +356,17 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // Declarative View rendering in Bubble Tea v2
 func (m appModel) View() tea.View {
 	var v tea.View
-	v.AltScreen = true                    // Declarative alternate screen
-	v.MouseMode = tea.MouseModeCellMotion // Enable mouse scroll wheel
+	v.AltScreen = true                             // Declarative alternate screen
+	v.MouseMode = tea.MouseModeCellMotion          // Enable mouse scroll wheel
+	v.KeyboardEnhancements.ReportEventTypes = true // Support shift+enter, etc.
 
 	var ui string
-	if m.state == StateNormal {
+	switch m.state {
+	case StateNormal:
 		ui = m.renderNormal()
-	} else if m.state == StatePromptNameInput {
+	case StatePromptNameInput:
 		ui = m.renderPromptNameInput()
-	} else {
+	default:
 		ui = m.renderMenu()
 	}
 
@@ -298,35 +374,48 @@ func (m appModel) View() tea.View {
 	return v
 }
 
-// -------------------------------------------------------------------------
 // Layout & UI Renderers
-// -------------------------------------------------------------------------
 
 var (
 	baseStyle   = lipgloss.NewStyle().Padding(1, 2)
 	titleStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
 	inputStyle  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("63")).Padding(0, 1)
 	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).MarginBottom(1)
-	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Render("█")
+
+	// Custom cursor renderer
+	cursorBgStyle = lipgloss.NewStyle().Background(lipgloss.Color("212")).Foreground(lipgloss.Color("232"))
+	cursorBlock   = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Render("█")
 )
 
 func (m appModel) renderNormal() string {
 	activeMCPs := m.getActiveMCPs()
 
-	statusText := fmt.Sprintf(" Model: %s | Prompt: %s | MCP: %d active | (ctrl+p) menu", m.activeModel, m.activeSys, len(activeMCPs))
+	statusText := fmt.Sprintf(" Model: %s | Prompt: %s | MCP: %d active | (ctrl+p) menu | (esc esc) cancel", m.activeModel, m.activeSys, len(activeMCPs))
 	if m.isLoading {
 		statusText = " ⏳ Generating response... " + statusText
 	}
 	status := statusStyle.Render(statusText)
 
-	inputBox := inputStyle.Width(m.width - 4).Render(m.input + cursorStyle)
+	// Render multiline input with cursor
+	var inBuilder strings.Builder
+	for i, r := range m.input {
+		if i == m.cursorIdx {
+			inBuilder.WriteString(cursorBgStyle.Render(string(r)))
+		} else {
+			inBuilder.WriteRune(r)
+		}
+	}
+	if m.cursorIdx == len(m.input) {
+		inBuilder.WriteString(cursorBlock)
+	}
+	inputBox := inputStyle.Width(m.width - 4).Render(inBuilder.String())
 
 	mdHeight := m.height - lipgloss.Height(status) - lipgloss.Height(inputBox) - 2
 	if mdHeight < 5 {
 		mdHeight = 5
 	}
 
-	// 1. Build Markdown String for the entire history
+	// Build Markdown String for the entire history
 	var sb strings.Builder
 	if len(m.history) == 0 {
 		sb.WriteString("*Awaiting prompt...*\n")
@@ -349,14 +438,14 @@ func (m appModel) renderNormal() string {
 		sb.WriteString("**✨ Assistant:**\n*Generating response...*\n")
 	}
 
-	// 2. Render Markdown via Glamour
+	// Render Markdown via Glamour
 	r, _ := glamour.NewTermRenderer(
 		glamour.WithStandardStyle("dark"),
 		glamour.WithWordWrap(m.width-4),
 	)
 	rendered, _ := r.Render(sb.String())
 
-	// 3. Handle Viewport Scrolling
+	// Handle Viewport Scrolling (0 means bottom)
 	lines := strings.Split(rendered, "\n")
 	maxScroll := len(lines) - mdHeight
 	if maxScroll < 0 {
@@ -371,12 +460,16 @@ func (m appModel) renderNormal() string {
 		m.scrollOffset = 0
 	}
 
-	endIdx := m.scrollOffset + mdHeight
+	startIdx := maxScroll - m.scrollOffset
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	endIdx := startIdx + mdHeight
 	if endIdx > len(lines) {
 		endIdx = len(lines)
 	}
 
-	renderedPort := strings.Join(lines[m.scrollOffset:endIdx], "\n")
+	renderedPort := strings.Join(lines[startIdx:endIdx], "\n")
 
 	topArea := lipgloss.Place(
 		m.width-4, mdHeight,
@@ -390,7 +483,7 @@ func (m appModel) renderNormal() string {
 
 func (m appModel) renderPromptNameInput() string {
 	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1, 2).Render(
-		titleStyle.Render("Enter New Prompt Name:") + "\n\n" + m.newPrompt + cursorStyle,
+		titleStyle.Render("Enter New Prompt Name:") + "\n\n" + string(m.newPrompt) + cursorBlock,
 	)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
@@ -432,9 +525,7 @@ func (m appModel) renderMenu() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
-// -------------------------------------------------------------------------
 // Action Handlers & Logic
-// -------------------------------------------------------------------------
 
 func (m *appModel) handleMenuSelection() (tea.Model, tea.Cmd) {
 	switch m.state {
@@ -454,13 +545,21 @@ func (m *appModel) handleMenuSelection() (tea.Model, tea.Cmd) {
 			}
 		case 2:
 			m.state = StatePromptNameInput
-			m.newPrompt = ""
+			m.newPrompt = []rune{}
 		case 3:
 			m.state = StateMCPManage
 			m.menuItems = make([]string, len(m.config.MCPServers))
 			for i, srv := range m.config.MCPServers {
 				m.menuItems[i] = srv.Name
 			}
+		case 4: // New Session
+			m.state = StateNormal
+			m.history = nil
+			m.promptHistory = nil
+			m.historyIdx = 0
+			m.input = []rune{}
+			m.cursorIdx = 0
+			m.scrollOffset = 0
 		}
 		m.menuCursor = 0
 
@@ -499,8 +598,44 @@ func (m appModel) getActiveMCPs() []string {
 	return active
 }
 
-// requestLLM uses charm.land/fantasy to route requests and tools!
-func (m appModel) requestLLM(prompt, sysContent string, activeMCPs []string) tea.Cmd {
+// buildAssistantResponse safely extracts all steps and Tool Calls/Results from Fantasy
+func buildAssistantResponse(res *fantasy.AgentResult) string {
+	var sb strings.Builder
+	for _, step := range res.Steps {
+		for _, msg := range step.Messages {
+			switch msg.Role {
+			case fantasy.MessageRoleAssistant:
+				for _, part := range msg.Content {
+					if tc, ok := fantasy.AsMessagePart[fantasy.ToolCallPart](part); ok {
+						sb.WriteString(fmt.Sprintf("\n> 🛠️ **Tool Call**: `%s`\n> Input: `%s`\n\n", tc.ToolName, tc.Input))
+					}
+				}
+			case fantasy.MessageRoleTool:
+				for _, part := range msg.Content {
+					if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
+						sb.WriteString(fmt.Sprintf("\n> 📋 **Tool Result** (`%s`):\n", tr.ToolCallID))
+						if textRes, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentText](tr.Output); ok {
+							out := textRes.Text
+							if len(out) > 2000 {
+								out = out[:2000] + "\n... (truncated)"
+							}
+							// Format smoothly inside blockquotes
+							sb.WriteString(fmt.Sprintf("> ```\n> %s\n> ```\n\n", strings.ReplaceAll(out, "\n", "\n> ")))
+						}
+					}
+				}
+			}
+		}
+	}
+	finalText := res.Response.Content.Text()
+	if finalText != "" {
+		sb.WriteString("\n" + finalText)
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+// requestLLM uses charm.land/fantasy to route requests and tools
+func (m appModel) requestLLM(ctx context.Context, prompt, sysContent string, activeMCPs []string) tea.Cmd {
 	return func() tea.Msg {
 		var modelCfg *ModelConfig
 		for _, mod := range m.config.Models {
@@ -522,7 +657,6 @@ func (m appModel) requestLLM(prompt, sysContent string, activeMCPs []string) tea
 		var provider fantasy.Provider
 		var err error
 
-		// Map to fantasy providers
 		switch modelCfg.Provider {
 		case "openai":
 			provider, err = openai.New(openai.WithAPIKey(providerCfg.APIKey))
@@ -543,12 +677,11 @@ func (m appModel) requestLLM(prompt, sysContent string, activeMCPs []string) tea
 			return llmResponseMsg{err: err}
 		}
 
-		langModel, err := provider.LanguageModel(context.Background(), modelCfg.Name)
+		langModel, err := provider.LanguageModel(ctx, modelCfg.Name)
 		if err != nil {
 			return llmResponseMsg{err: err}
 		}
 
-		// Prepare active MCP tools mapped to Fantasy AgentTools
 		var agentTools []fantasy.AgentTool
 		var activeToolNames []string
 
@@ -558,8 +691,7 @@ func (m appModel) requestLLM(prompt, sysContent string, activeMCPs []string) tea
 				continue
 			}
 
-			// Get tool list from MCP
-			res, err := client.ListTools(context.Background(), mcp.ListToolsRequest{})
+			res, err := client.ListTools(ctx, mcp.ListToolsRequest{})
 			if err == nil {
 				for _, t := range res.Tools {
 					agentTools = append(agentTools, &MCPToolWrapper{
@@ -571,7 +703,6 @@ func (m appModel) requestLLM(prompt, sysContent string, activeMCPs []string) tea
 			}
 		}
 
-		// Create the Fantasy Agent with tools and the system prompt
 		agent := fantasy.NewAgent(
 			langModel,
 			fantasy.WithTools(agentTools...),
@@ -583,12 +714,14 @@ func (m appModel) requestLLM(prompt, sysContent string, activeMCPs []string) tea
 			ActiveTools: activeToolNames,
 		}
 
-		// Execute Fantasy Agent (handles routing to provider AND intercepting MCP tool calls)
-		result, err := agent.Generate(context.Background(), call)
+		result, err := agent.Generate(ctx, call)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil // Discard message since it's already handled via ESC ESC
+			}
 			return llmResponseMsg{err: err}
 		}
 
-		return llmResponseMsg{text: result.Response.Content.Text()}
+		return llmResponseMsg{result: result}
 	}
 }
