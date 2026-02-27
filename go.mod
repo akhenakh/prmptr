@@ -3,6 +3,7 @@ module github.com/akhenakh/prmtr
 go 1.26.0
 
 require (
+	charm.land/bubbles/v2 v2.0.0
 	charm.land/bubbletea/v2 v2.0.0
 	charm.land/fantasy v0.11.0
 	charm.land/glamour/v2 v2.0.0-20260226140904-e36ae5e1858e
@@ -39,7 +40,7 @@ require (
 	github.com/kaptinlin/messageformat-go v0.4.18 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
-	github.com/mattn/go-runewidth v0.0.19 // indirect
+	github.com/mattn/go-runewidth v0.0.20 // indirect
 	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/openai/openai-go/v2 v2.7.1 // indirect

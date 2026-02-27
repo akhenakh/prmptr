@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/fantasy"
 	"charm.land/fantasy/providers/openai"
@@ -58,6 +59,9 @@ type appModel struct {
 	state     AppState
 	isLoading bool
 
+	// UI Components
+	spinner spinner.Model
+
 	// Advanced Text Input
 	input     []rune
 	cursorIdx int
@@ -101,6 +105,11 @@ func initialModel(cfg *Config) appModel {
 		activeSys = cfg.SystemPrompts[0].Name
 	}
 
+	// Initialize Spinner
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+
 	return appModel{
 		config:      cfg,
 		state:       StateNormal,
@@ -109,16 +118,27 @@ func initialModel(cfg *Config) appModel {
 		mcpManager:  NewMCPManager(cfg.MCPServers),
 		history:     make([]interaction, 0),
 		input:       make([]rune, 0),
+		spinner:     s,
 	}
 }
 
 // Bubble Tea v2 Lifecycle
 
 func (m appModel) Init() tea.Cmd {
-	return nil
+	return m.spinner.Tick
 }
 
 func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
+	// Unconditionally update the spinner so it animates smoothly
+	var spinCmd tea.Cmd
+	m.spinner, spinCmd = m.spinner.Update(msg)
+	if spinCmd != nil {
+		cmds = append(cmds, spinCmd)
+	}
+
+	// Main Event Dispatcher
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -196,12 +216,12 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.state = StateNormal
 			m.lastEsc = now
-			return m, nil
+			return m, tea.Batch(cmds...)
 		}
 
-		// Don't process input if we are waiting for LLM
+		// Don't process other inputs if we are waiting for the LLM
 		if m.isLoading {
-			return m, nil
+			return m, tea.Batch(cmds...)
 		}
 
 		if msg.String() == "ctrl+p" {
@@ -214,7 +234,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				"Manage MCP Servers",
 				"New Session",
 			}
-			return m, nil
+			return m, tea.Batch(cmds...)
 		}
 
 		switch m.state {
@@ -246,8 +266,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					ctx, cancel := context.WithCancel(context.Background())
 					m.cancelGen = cancel
 
-					cmd := m.requestLLM(ctx, strInput, sysPrompt, mcps)
-					return m, cmd
+					llmCmd := m.requestLLM(ctx, strInput, sysPrompt, mcps)
+					cmds = append(cmds, llmCmd, m.spinner.Tick)
+					return m, tea.Batch(cmds...)
 				}
 			case "shift+enter", "alt+enter":
 				m.input = append(m.input[:m.cursorIdx], append([]rune{'\n'}, m.input[m.cursorIdx:]...)...)
@@ -318,9 +339,11 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 
 					c := exec.Command(editor, f.Name())
-					return m, tea.ExecProcess(c, func(err error) tea.Msg {
+					execCmd := tea.ExecProcess(c, func(err error) tea.Msg {
 						return editorFinishedMsg{err: err, file: f.Name(), name: nameStr}
 					})
+					cmds = append(cmds, execCmd)
+					return m, tea.Batch(cmds...)
 				}
 			case "backspace":
 				if len(m.newPrompt) > 0 {
@@ -345,12 +368,14 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.menuCursor++
 				}
 			case "enter":
-				return m.handleMenuSelection()
+				mod, cmd := m.handleMenuSelection()
+				cmds = append(cmds, cmd)
+				return mod, tea.Batch(cmds...)
 			}
 		}
 	}
 
-	return m, nil
+	return m, tea.Batch(cmds...)
 }
 
 // Declarative View rendering in Bubble Tea v2
@@ -391,8 +416,12 @@ func (m appModel) renderNormal() string {
 	activeMCPs := m.getActiveMCPs()
 
 	statusText := fmt.Sprintf(" Model: %s | Prompt: %s | MCP: %d active | (ctrl+p) menu | (esc esc) cancel", m.activeModel, m.activeSys, len(activeMCPs))
+
+	// Prepend the spinner to the status bar if loading
 	if m.isLoading {
-		statusText = " ⏳ Generating response... " + statusText
+		statusText = fmt.Sprintf(" %s Generating response... |%s", m.spinner.View(), statusText)
+	} else {
+		statusText = " " + statusText
 	}
 	status := statusStyle.Render(statusText)
 
@@ -619,7 +648,6 @@ func buildAssistantResponse(res *fantasy.AgentResult) string {
 							if len(out) > 2000 {
 								out = out[:2000] + "\n... (truncated)"
 							}
-							// Format smoothly inside blockquotes
 							sb.WriteString(fmt.Sprintf("> ```\n> %s\n> ```\n\n", strings.ReplaceAll(out, "\n", "\n> ")))
 						}
 					}
