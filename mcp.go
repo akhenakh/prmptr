@@ -120,7 +120,13 @@ func NewMCPManager(servers []MCPServerConfig) *MCPManager {
 		var c *client.Client
 		var err error
 
-		switch srv.Type {
+		// Default to stdio if type is not specified and command is present
+		srvType := srv.Type
+		if srvType == "" && srv.Command != "" {
+			srvType = "stdio"
+		}
+
+		switch srvType {
 		case "stdio":
 			c, err = client.NewStdioMCPClient(srv.Command, nil, srv.Args...)
 		case "sse":
@@ -128,6 +134,8 @@ func NewMCPManager(servers []MCPServerConfig) *MCPManager {
 			if err == nil {
 				err = c.Start(ctx)
 			}
+		default:
+			continue // Skip servers with unsupported type
 		}
 
 		if err != nil {
