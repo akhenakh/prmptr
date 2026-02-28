@@ -8,6 +8,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Config & Data Structures
 type Config struct {
 	Providers     map[string]ProviderConfig `yaml:"providers"`
 	Models        []ModelConfig             `yaml:"models"`

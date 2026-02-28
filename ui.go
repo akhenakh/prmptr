@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -32,24 +33,30 @@ const (
 	StatePromptNameInput
 )
 
-type llmResponseMsg struct {
-	result *fantasy.AgentResult
-	err    error
-}
-
 type editorFinishedMsg struct {
 	err  error
 	file string
 	name string
 }
 
+type feedbackMsg struct{}
+
+// Stream Messaging
+type streamTextMsg string
+type streamToolCallMsg fantasy.ToolCallContent
+type streamToolResultMsg fantasy.ToolResultContent
+type streamDoneMsg struct{}
+type streamErrMsg error
+
 // interaction represents a single turn in the chat history
 type interaction struct {
-	Role    string
-	Content string
-	System  string   // Only populated for User role
-	MCPs    []string // Only populated for User role
-	Model   string   // Only populated for User role
+	Role        string
+	System      string   // Only populated for User role
+	MCPs        []string // Only populated for User role
+	Model       string   // Only populated for User role
+	Text        string
+	ToolCalls   []fantasy.ToolCallContent
+	ToolResults []fantasy.ToolResultContent
 }
 
 type appModel struct {
@@ -60,7 +67,8 @@ type appModel struct {
 	isLoading bool
 
 	// UI Components
-	spinner spinner.Model
+	spinner      spinner.Model
+	feedbackText string
 
 	// Advanced Text Input
 	input     []rune
@@ -73,9 +81,10 @@ type appModel struct {
 	historyIdx    int
 	scrollOffset  int // 0 is bottom, >0 is scrolled up
 
-	// Cancellations & Hotkeys
-	cancelGen context.CancelFunc
-	lastEsc   time.Time
+	// Event Channels & Concurrency
+	streamChan chan tea.Msg
+	cancelGen  context.CancelFunc
+	lastEsc    time.Time
 
 	// Active Selections
 	activeModel string
@@ -121,6 +130,7 @@ func initialModel(cfg *Config) appModel {
 		history:     make([]interaction, 0),
 		input:       make([]rune, 0),
 		spinner:     s,
+		streamChan:  make(chan tea.Msg, 100),
 	}
 }
 
@@ -128,6 +138,17 @@ func initialModel(cfg *Config) appModel {
 
 func (m appModel) Init() tea.Cmd {
 	return m.spinner.Tick
+}
+
+func waitForStream(c chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		return <-c
+	}
+}
+
+func clearFeedback() tea.Msg {
+	time.Sleep(3 * time.Second)
+	return feedbackMsg{}
 }
 
 func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -146,22 +167,45 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
-	case llmResponseMsg:
+	// Streaming Handlers
+	case streamTextMsg:
+		if len(m.history) > 0 {
+			lastIdx := len(m.history) - 1
+			m.history[lastIdx].Text += string(msg)
+			m.scrollOffset = 0 // Force snap to bottom during stream
+		}
+		cmds = append(cmds, waitForStream(m.streamChan))
+
+	case streamToolCallMsg:
+		if len(m.history) > 0 {
+			lastIdx := len(m.history) - 1
+			m.history[lastIdx].ToolCalls = append(m.history[lastIdx].ToolCalls, fantasy.ToolCallContent(msg))
+			m.scrollOffset = 0
+		}
+		cmds = append(cmds, waitForStream(m.streamChan))
+
+	case streamToolResultMsg:
+		if len(m.history) > 0 {
+			lastIdx := len(m.history) - 1
+			m.history[lastIdx].ToolResults = append(m.history[lastIdx].ToolResults, fantasy.ToolResultContent(msg))
+			m.scrollOffset = 0
+		}
+		cmds = append(cmds, waitForStream(m.streamChan))
+
+	case streamErrMsg:
 		m.isLoading = false
 		m.cancelGen = nil
-		m.scrollOffset = 0 // Auto-scroll to bottom
-
-		if msg.err != nil {
-			m.history = append(m.history, interaction{
-				Role:    "Assistant",
-				Content: fmt.Sprintf("**Error:** %v", msg.err),
-			})
-		} else if msg.result != nil {
-			m.history = append(m.history, interaction{
-				Role:    "Assistant",
-				Content: buildAssistantResponse(msg.result),
-			})
+		if len(m.history) > 0 {
+			lastIdx := len(m.history) - 1
+			m.history[lastIdx].Text += fmt.Sprintf("\n\n**Error:** %v", error(msg))
 		}
+
+	case streamDoneMsg:
+		m.isLoading = false
+		m.cancelGen = nil
+
+	case feedbackMsg:
+		m.feedbackText = ""
 
 	case editorFinishedMsg:
 		if msg.err == nil {
@@ -182,19 +226,20 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursorIdx += len(runes)
 		}
 
-	// Mouse Scrolling
+	// Mouse Scrolling Support
 	case tea.MouseWheelMsg:
 		if m.state == StateNormal {
 			switch msg.Button {
 			case tea.MouseWheelUp:
-				m.scrollOffset += 3
+				m.scrollOffset += 3 // Scroll up into history
 			case tea.MouseWheelDown:
-				m.scrollOffset -= 3
+				m.scrollOffset -= 3 // Scroll down to latest
 			}
 		}
 
 	// Keyboard Support
 	case tea.KeyPressMsg:
+		// Global Quit
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
@@ -207,10 +252,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cancelGen()
 					m.cancelGen = nil
 					m.isLoading = false
-					m.history = append(m.history, interaction{
-						Role:    "Assistant",
-						Content: "*Cancelled by user.*",
-					})
+					if len(m.history) > 0 {
+						m.history[len(m.history)-1].Text += "\n\n*Cancelled by user.*"
+					}
 				}
 				m.input = []rune{}
 				m.cursorIdx = 0
@@ -221,7 +265,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 
-		// Don't process other inputs if we are waiting for the LLM
+		// Don't process normal input if we are waiting for LLM
 		if m.isLoading {
 			return m, tea.Batch(cmds...)
 		}
@@ -239,6 +283,27 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 
+		if msg.String() == "ctrl+n" {
+			// New Session
+			m.history = nil
+			m.promptHistory = nil
+			m.historyIdx = 0
+			m.input = []rune{}
+			m.cursorIdx = 0
+			m.scrollOffset = 0
+			m.memoryStore = NewMemoryStore()
+			m.feedbackText = "New Session Started"
+			cmds = append(cmds, clearFeedback)
+			return m, tea.Batch(cmds...)
+		}
+
+		if msg.String() == "ctrl+s" {
+			filename := saveHistoryToMarkdown(m.history)
+			m.feedbackText = fmt.Sprintf("Saved to %s", filename)
+			cmds = append(cmds, clearFeedback)
+			return m, tea.Batch(cmds...)
+		}
+
 		switch m.state {
 		case StateNormal:
 			switch msg.String() {
@@ -251,25 +316,33 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.promptHistory = append(m.promptHistory, strInput)
 					m.historyIdx = len(m.promptHistory)
 
+					// Add User message
 					m.history = append(m.history, interaction{
-						Role:    "User",
-						Content: strInput,
-						System:  sysPrompt,
-						MCPs:    mcps,
-						Model:   m.activeModel,
+						Role:   "User",
+						Text:   strInput,
+						System: sysPrompt,
+						MCPs:   mcps,
+						Model:  m.activeModel,
+					})
+
+					// Add empty Assistant placeholder
+					m.history = append(m.history, interaction{
+						Role: "Assistant",
+						Text: "",
 					})
 
 					m.input = []rune{}
 					m.cursorIdx = 0
 					m.isLoading = true
-					m.scrollOffset = 0 // Snap to bottom
+					m.scrollOffset = 0
 
 					// Run LLM call with a cancelable context
 					ctx, cancel := context.WithCancel(context.Background())
 					m.cancelGen = cancel
 
-					llmCmd := m.requestLLM(ctx, strInput, sysPrompt, mcps)
-					cmds = append(cmds, llmCmd)
+					// Start stream in background
+					go m.startLLMStream(ctx, strInput, sysPrompt, mcps)
+					cmds = append(cmds, waitForStream(m.streamChan))
 					return m, tea.Batch(cmds...)
 				}
 			case "shift+enter", "alt+enter":
@@ -312,9 +385,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursorIdx = 0
 			case "ctrl+e", "end":
 				m.cursorIdx = len(m.input)
-			case "pgup":
+			case "pgup", "pageup":
 				m.scrollOffset += (m.height / 2)
-			case "pgdown":
+			case "pgdown", "pagedown":
 				m.scrollOffset -= (m.height / 2)
 			case "space":
 				m.input = append(m.input[:m.cursorIdx], append([]rune{' '}, m.input[m.cursorIdx:]...)...)
@@ -383,9 +456,12 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // Declarative View rendering in Bubble Tea v2
 func (m appModel) View() tea.View {
 	var v tea.View
-	v.AltScreen = true                             // Declarative alternate screen
-	v.MouseMode = tea.MouseModeCellMotion          // Enable mouse scroll wheel
-	v.KeyboardEnhancements.ReportEventTypes = true // Support shift+enter, etc.
+	v.AltScreen = true
+
+	// Restored MouseModeCellMotion to capture MouseWheel events.
+	// Users can hold 'Shift' to bypass this and use native terminal selection!
+	v.MouseMode = tea.MouseModeCellMotion
+	v.KeyboardEnhancements.ReportEventTypes = true
 
 	var ui string
 	switch m.state {
@@ -408,6 +484,7 @@ var (
 	titleStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
 	inputStyle  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("63")).Padding(0, 1)
 	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).MarginBottom(1)
+	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true).MarginBottom(1)
 
 	cursorBgStyle = lipgloss.NewStyle().Background(lipgloss.Color("212")).Foreground(lipgloss.Color("232"))
 	cursorBlock   = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Render("█")
@@ -416,16 +493,20 @@ var (
 func (m appModel) renderNormal() string {
 	activeMCPs := m.getActiveMCPs()
 
-	statusText := fmt.Sprintf(" Model: %s | Prompt: %s | MCP: %d active | Mem: %d items | (esc esc) cancel",
+	statusText := fmt.Sprintf(" Model: %s | Prompt: %s | MCP: %d | Mem: %d | ^P Menu | ^N New | ^S Save | esc esc Cancel",
 		m.activeModel, m.activeSys, len(activeMCPs), len(m.memoryStore.store))
 
-	// Prepend the spinner to the status bar if loading
-	if m.isLoading {
-		statusText = fmt.Sprintf(" %s Generating response... |%s", m.spinner.View(), statusText)
+	var statusRender string
+	if m.feedbackText != "" {
+		statusRender = warnStyle.Render(" " + m.feedbackText)
 	} else {
-		statusText = " " + statusText
+		if m.isLoading {
+			statusText = fmt.Sprintf(" %s Generating... |%s", m.spinner.View(), statusText)
+		} else {
+			statusText = " " + statusText
+		}
+		statusRender = statusStyle.Render(statusText)
 	}
-	status := statusStyle.Render(statusText)
 
 	// Render multiline input with cursor
 	var inBuilder strings.Builder
@@ -441,7 +522,7 @@ func (m appModel) renderNormal() string {
 	}
 	inputBox := inputStyle.Width(m.width - 4).Render(inBuilder.String())
 
-	mdHeight := m.height - lipgloss.Height(status) - lipgloss.Height(inputBox) - 2
+	mdHeight := m.height - lipgloss.Height(statusRender) - lipgloss.Height(inputBox) - 2
 	if mdHeight < 5 {
 		mdHeight = 5
 	}
@@ -449,7 +530,7 @@ func (m appModel) renderNormal() string {
 	// Build Markdown String for the entire history
 	var sb strings.Builder
 	if len(m.history) == 0 {
-		sb.WriteString("*Awaiting prompt...*\n")
+		sb.WriteString("*Awaiting prompt... (Hold `Shift` to select and copy text naturally)*\n")
 	}
 
 	for _, item := range m.history {
@@ -460,27 +541,37 @@ func (m appModel) renderNormal() string {
 				sb.WriteString(fmt.Sprintf("**🔌 MCPs:** `%s`\n", strings.Join(item.MCPs, "`, `")))
 			}
 			sb.WriteString(fmt.Sprintf("**🧠 Model:** `%s`\n\n", item.Model))
-			sb.WriteString(fmt.Sprintf("**👤 User:**\n%s\n\n", item.Content))
+			sb.WriteString(fmt.Sprintf("**👤 User:**\n%s\n\n", item.Text))
 		} else {
-			sb.WriteString(fmt.Sprintf("**✨ Assistant:**\n%s\n\n", item.Content))
+			sb.WriteString("**✨ Assistant:**\n")
+			for _, tc := range item.ToolCalls {
+				sb.WriteString(fmt.Sprintf("> 🛠️ **Tool Call**: `%s`\n> Input: `%s`\n\n", tc.ToolName, tc.Input))
+			}
+			for _, tr := range item.ToolResults {
+				if textRes, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentText](tr.Result); ok {
+					formatted := formatToolResult(textRes.Text, true) // truncate for UI
+					sb.WriteString(fmt.Sprintf("> 📋 **Tool Result** (`%s`):\n", tr.ToolCallID))
+					sb.WriteString(fmt.Sprintf("> ```\n> %s\n> ```\n\n", strings.ReplaceAll(formatted, "\n", "\n> ")))
+				}
+			}
+			if item.Text != "" {
+				sb.WriteString(item.Text + "\n\n")
+			}
 		}
 	}
 
-	// Render Markdown via Glamour
 	r, _ := glamour.NewTermRenderer(
 		glamour.WithStandardStyle("dark"),
 		glamour.WithWordWrap(m.width-4),
 	)
 	rendered, _ := r.Render(sb.String())
 
-	// Handle Viewport Scrolling (0 means bottom)
 	lines := strings.Split(rendered, "\n")
 	maxScroll := len(lines) - mdHeight
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
 
-	// Clamp scroll offset
 	if m.scrollOffset > maxScroll {
 		m.scrollOffset = maxScroll
 	}
@@ -505,7 +596,7 @@ func (m appModel) renderNormal() string {
 		renderedPort,
 	)
 
-	content := lipgloss.JoinVertical(lipgloss.Left, topArea, status, inputBox)
+	content := lipgloss.JoinVertical(lipgloss.Left, topArea, statusRender, inputBox)
 	return baseStyle.Render(content)
 }
 
@@ -588,7 +679,7 @@ func (m *appModel) handleMenuSelection() (tea.Model, tea.Cmd) {
 			m.input = []rune{}
 			m.cursorIdx = 0
 			m.scrollOffset = 0
-			m.memoryStore = NewMemoryStore() // reset memory
+			m.memoryStore = NewMemoryStore()
 		}
 		m.menuCursor = 0
 
@@ -627,207 +718,267 @@ func (m appModel) getActiveMCPs() []string {
 	return active
 }
 
-// buildAssistantResponse safely extracts all steps and Tool Calls/Results from Fantasy
-func buildAssistantResponse(res *fantasy.AgentResult) string {
-	var sb strings.Builder
-	for _, step := range res.Steps {
-		for _, msg := range step.Messages {
-			switch msg.Role {
-			case fantasy.MessageRoleAssistant:
-				for _, part := range msg.Content {
-					if tc, ok := fantasy.AsMessagePart[fantasy.ToolCallPart](part); ok {
-						sb.WriteString(fmt.Sprintf("\n> 🛠️ **Tool Call**: `%s`\n> Input: `%s`\n\n", tc.ToolName, tc.Input))
-					}
-				}
-			case fantasy.MessageRoleTool:
-				for _, part := range msg.Content {
-					if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
-						sb.WriteString(fmt.Sprintf("\n> 📋 **Tool Result** (`%s`):\n", tr.ToolCallID))
-						if textRes, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentText](tr.Output); ok {
-							out := textRes.Text
-							if len(out) > 2000 {
-								out = out[:2000] + "\n... (truncated)"
-							}
-							sb.WriteString(fmt.Sprintf("> ```\n> %s\n> ```\n\n", strings.ReplaceAll(out, "\n", "\n> ")))
-						}
-					}
-				}
-			}
-		}
-	}
-	finalText := res.Response.Content.Text()
-	if finalText != "" {
-		sb.WriteString("\n" + finalText)
-	}
-	return strings.TrimSpace(sb.String())
-}
-
 func estimateTokens(text string) int {
 	return len(text) / 4 // 1 token ~ 4 chars
 }
 
-// requestLLM uses charm.land/fantasy to route requests and tools!
-func (m appModel) requestLLM(ctx context.Context, prompt, sysContent string, activeMCPs []string) tea.Cmd {
-	return func() tea.Msg {
-		var modelCfg *ModelConfig
-		for _, mod := range m.config.Models {
-			if mod.Name == m.activeModel {
-				modelCfg = &mod
-				break
+// smartFormat parses tool results. If it's JSON, it extracts markdown/content or prettifies.
+func formatToolResult(input string, truncate bool) string {
+	formatted := input
+	var data map[string]any
+
+	if err := json.Unmarshal([]byte(input), &data); err == nil {
+		found := false
+		for _, key := range []string{"markdown", "content", "response", "data", "text"} {
+			if val, ok := data[key]; ok {
+				if strVal, isStr := val.(string); isStr {
+					formatted = strVal
+					found = true
+					break
+				}
 			}
 		}
-
-		if modelCfg == nil {
-			return llmResponseMsg{err: fmt.Errorf("model %s not found", m.activeModel)}
+		if !found {
+			pretty, _ := json.MarshalIndent(data, "", "  ")
+			formatted = "```json\n" + string(pretty) + "\n```"
 		}
+	}
 
-		providerCfg, ok := m.config.Providers[modelCfg.Provider]
-		if !ok {
-			return llmResponseMsg{err: fmt.Errorf("provider %s not found", modelCfg.Provider)}
+	if truncate && len(formatted) > 2000 {
+		return formatted[:2000] + "\n... (truncated for UI)"
+	}
+	return formatted
+}
+
+// saveHistoryToMarkdown saves the full untruncated conversation to a file.
+func saveHistoryToMarkdown(history []interaction) string {
+	if len(history) == 0 {
+		return ""
+	}
+
+	var firstPrompt string
+	for _, item := range history {
+		if item.Role == "User" {
+			firstPrompt = item.Text
+			break
 		}
+	}
 
-		var provider fantasy.Provider
-		var err error
+	safeName := strings.ReplaceAll(firstPrompt, " ", "_")
+	safeName = strings.ReplaceAll(safeName, "/", "_")
+	safeName = strings.ReplaceAll(safeName, "\n", "")
+	if len(safeName) > 20 {
+		safeName = safeName[:20]
+	}
 
-		switch modelCfg.Provider {
-		case "openai":
-			provider, err = openai.New(openai.WithAPIKey(providerCfg.APIKey))
-		case "ollama":
-			url := providerCfg.BaseURL
-			if !strings.HasSuffix(url, "/v1") {
-				url = strings.TrimRight(url, "/") + "/v1"
+	filename := time.Now().Format("2006-01-02") + "_" + safeName + ".md"
+
+	var sb strings.Builder
+	for _, item := range history {
+		if item.Role == "User" {
+			sb.WriteString(fmt.Sprintf("## User\n**System**: %s\n**Model**: %s\n\n%s\n\n", item.System, item.Model, item.Text))
+		} else {
+			sb.WriteString("## Assistant\n")
+			for _, tc := range item.ToolCalls {
+				sb.WriteString(fmt.Sprintf("\n> **Tool Call**: `%s`\n> Input: `%s`\n", tc.ToolName, tc.Input))
 			}
-			provider, err = openaicompat.New(
-				openaicompat.WithBaseURL(url),
-				openaicompat.WithAPIKey("ollama-compat"),
-			)
-		default:
-			return llmResponseMsg{err: fmt.Errorf("unsupported provider type: %s", modelCfg.Provider)}
-		}
-
-		if err != nil {
-			return llmResponseMsg{err: err}
-		}
-
-		langModel, err := provider.LanguageModel(ctx, modelCfg.Name)
-		if err != nil {
-			return llmResponseMsg{err: err}
-		}
-
-		// Sliding window for Conversation History
-		maxCtx := modelCfg.MaxContextSize
-		if maxCtx <= 0 {
-			maxCtx = 8192
-		}
-
-		// Reserve 25% of context for system prompt, generated output, and tool schemas
-		budget := int(float64(maxCtx) * 0.75)
-
-		var historyMsgs []fantasy.Message
-		currentTokens := estimateTokens(sysContent) + estimateTokens(prompt)
-
-		// Loop backwards over history. `m.history` includes the user's latest prompt as the last element.
-		// So we skip the very last element (len-1) because we'll pass it in the explicit `Prompt` field.
-		for i := len(m.history) - 2; i >= 0; i-- {
-			item := m.history[i]
-			tokens := estimateTokens(item.Content)
-
-			if currentTokens+tokens > budget {
-				break // Stop adding older messages, budget reached
+			for _, tr := range item.ToolResults {
+				if textRes, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentText](tr.Result); ok {
+					// Pass false to ensure we DO NOT truncate the file
+					sb.WriteString(fmt.Sprintf("\n> **Tool Result** (`%s`):\n\n%s\n\n", tr.ToolCallID, formatToolResult(textRes.Text, false)))
+				}
 			}
-			currentTokens += tokens
+			sb.WriteString(item.Text + "\n\n")
+		}
+	}
 
-			role := fantasy.MessageRole("user")
-			if item.Role == "Assistant" {
-				role = fantasy.MessageRole("assistant")
-			}
+	os.WriteFile(filename, []byte(sb.String()), 0644)
+	return filename
+}
 
-			historyMsgs = append(historyMsgs, fantasy.Message{
-				Role: role,
-				Content: []fantasy.MessagePart{
-					fantasy.TextPart{Text: item.Content},
-				},
+func (m appModel) startLLMStream(ctx context.Context, prompt, sysContent string, activeMCPs []string) {
+	var modelCfg *ModelConfig
+	for _, mod := range m.config.Models {
+		if mod.Name == m.activeModel {
+			modelCfg = &mod
+			break
+		}
+	}
+
+	if modelCfg == nil {
+		m.streamChan <- streamErrMsg(fmt.Errorf("model %s not found", m.activeModel))
+		return
+	}
+
+	providerCfg, ok := m.config.Providers[modelCfg.Provider]
+	if !ok {
+		m.streamChan <- streamErrMsg(fmt.Errorf("provider %s not found", modelCfg.Provider))
+		return
+	}
+
+	var provider fantasy.Provider
+	var err error
+
+	switch modelCfg.Provider {
+	case "openai":
+		provider, err = openai.New(openai.WithAPIKey(providerCfg.APIKey))
+	case "ollama":
+		url := providerCfg.BaseURL
+		if !strings.HasSuffix(url, "/v1") {
+			url = strings.TrimRight(url, "/") + "/v1"
+		}
+		provider, err = openaicompat.New(
+			openaicompat.WithBaseURL(url),
+			openaicompat.WithAPIKey("ollama-compat"),
+		)
+	default:
+		m.streamChan <- streamErrMsg(fmt.Errorf("unsupported provider type: %s", modelCfg.Provider))
+		return
+	}
+
+	if err != nil {
+		m.streamChan <- streamErrMsg(err)
+		return
+	}
+
+	langModel, err := provider.LanguageModel(ctx, modelCfg.Name)
+	if err != nil {
+		m.streamChan <- streamErrMsg(err)
+		return
+	}
+
+	// Sliding Window Context Budget
+	maxCtx := modelCfg.MaxContextSize
+	if maxCtx <= 0 {
+		maxCtx = 8192
+	}
+	budget := int(float64(maxCtx) * 0.75)
+
+	var historyMsgs []fantasy.Message
+	currentTokens := estimateTokens(sysContent) + estimateTokens(prompt)
+
+	// Build Fantasy history context backwards
+	for i := len(m.history) - 3; i >= 0; i-- {
+		item := m.history[i]
+		tokens := estimateTokens(item.Text)
+
+		if currentTokens+tokens > budget {
+			break
+		}
+		currentTokens += tokens
+
+		role := fantasy.MessageRole("user")
+		if item.Role == "Assistant" {
+			role = fantasy.MessageRole("assistant")
+		}
+
+		var parts []fantasy.MessagePart
+		if item.Text != "" {
+			parts = append(parts, fantasy.TextPart{Text: item.Text})
+		}
+		for _, tc := range item.ToolCalls {
+			parts = append(parts, fantasy.ToolCallPart{
+				ToolCallID: tc.ToolCallID,
+				ToolName:   tc.ToolName,
+				Input:      tc.Input,
+			})
+		}
+		for _, tr := range item.ToolResults {
+			parts = append(parts, fantasy.ToolResultPart{
+				ToolCallID: tr.ToolCallID,
+				Output:     tr.Result,
 			})
 		}
 
-		// Reverse it back since we appended backwards
-		for i, j := 0, len(historyMsgs)-1; i < j; i, j = i+1, j-1 {
-			historyMsgs[i], historyMsgs[j] = historyMsgs[j], historyMsgs[i]
+		if len(parts) > 0 {
+			historyMsgs = append(historyMsgs, fantasy.Message{Role: role, Content: parts})
 		}
-
-		// Setup Tools
-		var agentTools []fantasy.AgentTool
-		var activeToolNames []string
-
-		// Add the Native Query Memory Tool
-		queryMemTool := fantasy.NewAgentTool(
-			"query_memory",
-			"Query or summarize information from a large saved memory chunk. Use this when a tool returns a 'mem_...' ID instead of actual data.",
-			func(ctx context.Context, input QueryMemoryToolInput, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
-				text, exists := m.memoryStore.store[input.MemoryID]
-				if !exists {
-					return fantasy.NewTextErrorResponse(fmt.Sprintf("Memory ID %s not found", input.MemoryID)), nil
-				}
-
-				// Spawn stateless summarizer
-				queryAgent := fantasy.NewAgent(
-					langModel,
-					fantasy.WithSystemPrompt("You are a data extraction assistant. Extract information or summarize the following text according to the user's instructions. Keep your answer focused and concise."),
-				)
-
-				summaryPrompt := fmt.Sprintf("Instruction: %s\n\nData:\n%s", input.Instruction, text)
-				res, err := queryAgent.Generate(ctx, fantasy.AgentCall{Prompt: summaryPrompt})
-				if err != nil {
-					return fantasy.NewTextErrorResponse("Failed to query memory: " + err.Error()), nil
-				}
-
-				return fantasy.NewTextResponse(res.Response.Content.Text()), nil
-			},
-		)
-		agentTools = append(agentTools, queryMemTool)
-		activeToolNames = append(activeToolNames, "query_memory")
-
-		// Add Active MCP Tools
-		for _, srvName := range activeMCPs {
-			client := m.mcpManager.clients[srvName]
-			if client == nil {
-				continue
-			}
-
-			res, err := client.ListTools(ctx, mcp.ListToolsRequest{})
-			if err == nil {
-				for _, t := range res.Tools {
-					agentTools = append(agentTools, &MCPToolWrapper{
-						client:     client,
-						mcpTool:    t,
-						memory:     m.memoryStore, // Pass the memory store to the wrapper
-						maxContext: maxCtx,
-					})
-					activeToolNames = append(activeToolNames, t.Name)
-				}
-			}
-		}
-
-		agent := fantasy.NewAgent(
-			langModel,
-			fantasy.WithTools(agentTools...),
-			fantasy.WithSystemPrompt(sysContent),
-		)
-
-		call := fantasy.AgentCall{
-			Prompt:      prompt,      // Explicitly set the prompt here!
-			Messages:    historyMsgs, // Appended history sliding window
-			ActiveTools: activeToolNames,
-		}
-
-		result, err := agent.Generate(ctx, call)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil // Discard message since it's already handled via ESC ESC
-			}
-			return llmResponseMsg{err: err}
-		}
-
-		return llmResponseMsg{result: result}
 	}
+
+	for i, j := 0, len(historyMsgs)-1; i < j; i, j = i+1, j-1 {
+		historyMsgs[i], historyMsgs[j] = historyMsgs[j], historyMsgs[i]
+	}
+
+	// Setup Tools
+	var agentTools []fantasy.AgentTool
+	var activeToolNames []string
+
+	queryMemTool := fantasy.NewAgentTool(
+		"query_memory",
+		"Query or summarize information from a large saved memory chunk. Use this when a tool returns a 'mem_...' ID instead of actual data.",
+		func(ctx context.Context, input QueryMemoryToolInput, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			text, exists := m.memoryStore.store[input.MemoryID]
+			if !exists {
+				return fantasy.NewTextErrorResponse(fmt.Sprintf("Memory ID %s not found", input.MemoryID)), nil
+			}
+
+			queryAgent := fantasy.NewAgent(
+				langModel,
+				fantasy.WithSystemPrompt("You are a data extraction assistant. Extract information or summarize the following text according to the user's instructions. Keep your answer focused and concise."),
+			)
+
+			summaryPrompt := fmt.Sprintf("Instruction: %s\n\nData:\n%s", input.Instruction, text)
+			res, err := queryAgent.Generate(ctx, fantasy.AgentCall{Prompt: summaryPrompt})
+			if err != nil {
+				return fantasy.NewTextErrorResponse("Failed to query memory: " + err.Error()), nil
+			}
+
+			return fantasy.NewTextResponse(res.Response.Content.Text()), nil
+		},
+	)
+	agentTools = append(agentTools, queryMemTool)
+	activeToolNames = append(activeToolNames, "query_memory")
+
+	for _, srvName := range activeMCPs {
+		client := m.mcpManager.clients[srvName]
+		if client == nil {
+			continue
+		}
+
+		res, err := client.ListTools(ctx, mcp.ListToolsRequest{})
+		if err == nil {
+			for _, t := range res.Tools {
+				agentTools = append(agentTools, &MCPToolWrapper{
+					client:     client,
+					mcpTool:    t,
+					memory:     m.memoryStore,
+					maxContext: maxCtx,
+				})
+				activeToolNames = append(activeToolNames, t.Name)
+			}
+		}
+	}
+
+	agent := fantasy.NewAgent(
+		langModel,
+		fantasy.WithTools(agentTools...),
+		fantasy.WithSystemPrompt(sysContent),
+	)
+
+	// Execute streaming call
+	call := fantasy.AgentStreamCall{
+		Prompt:      prompt,
+		Messages:    historyMsgs,
+		ActiveTools: activeToolNames,
+		OnTextDelta: func(id, text string) error {
+			m.streamChan <- streamTextMsg(text)
+			return nil
+		},
+		OnToolCall: func(tc fantasy.ToolCallContent) error {
+			m.streamChan <- streamToolCallMsg(tc)
+			return nil
+		},
+		OnToolResult: func(tr fantasy.ToolResultContent) error {
+			m.streamChan <- streamToolResultMsg(tr)
+			return nil
+		},
+	}
+
+	_, err = agent.Stream(ctx, call)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		m.streamChan <- streamErrMsg(err)
+		return
+	}
+
+	m.streamChan <- streamDoneMsg{}
 }

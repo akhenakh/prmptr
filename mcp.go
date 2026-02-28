@@ -13,8 +13,6 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// Memory Store & Native Tools
-
 // MemoryStore holds large tool outputs in Go RAM so they don't blow up the LLM context.
 type MemoryStore struct {
 	store map[string]string
@@ -38,7 +36,9 @@ type QueryMemoryToolInput struct {
 	Instruction string `json:"instruction" description:"Specific instructions on what to extract or summarize from this memory"`
 }
 
+// -------------------------------------------------------------------------
 // MCP <-> Fantasy Bridge
+// -------------------------------------------------------------------------
 
 // MCPToolWrapper implements fantasy.AgentTool to bridge the AI SDK and MCP
 type MCPToolWrapper struct {
