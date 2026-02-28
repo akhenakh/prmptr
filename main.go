@@ -8,7 +8,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config & Data Structures
 type Config struct {
 	Providers     map[string]ProviderConfig `yaml:"providers"`
 	Models        []ModelConfig             `yaml:"models"`
@@ -22,8 +21,9 @@ type ProviderConfig struct {
 }
 
 type ModelConfig struct {
-	Name     string `yaml:"name"`
-	Provider string `yaml:"provider"`
+	Name           string `yaml:"name"`
+	Provider       string `yaml:"provider"`
+	MaxContextSize int    `yaml:"max_context_size"`
 }
 
 type MCPServerConfig struct {

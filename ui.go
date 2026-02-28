@@ -81,6 +81,7 @@ type appModel struct {
 	activeModel string
 	activeSys   string
 	mcpManager  *MCPManager
+	memoryStore *MemoryStore // Holds large data chunks
 
 	// Menus
 	menuCursor int
@@ -116,6 +117,7 @@ func initialModel(cfg *Config) appModel {
 		activeModel: activeMod,
 		activeSys:   activeSys,
 		mcpManager:  NewMCPManager(cfg.MCPServers),
+		memoryStore: NewMemoryStore(),
 		history:     make([]interaction, 0),
 		input:       make([]rune, 0),
 		spinner:     s,
@@ -180,14 +182,14 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursorIdx += len(runes)
 		}
 
-	// Mouse Scrolling Support
+	// Mouse Scrolling
 	case tea.MouseWheelMsg:
 		if m.state == StateNormal {
 			switch msg.Button {
 			case tea.MouseWheelUp:
-				m.scrollOffset += 3 // Scroll up into history
+				m.scrollOffset += 3
 			case tea.MouseWheelDown:
-				m.scrollOffset -= 3 // Scroll down to latest
+				m.scrollOffset -= 3
 			}
 		}
 
@@ -267,7 +269,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cancelGen = cancel
 
 					llmCmd := m.requestLLM(ctx, strInput, sysPrompt, mcps)
-					cmds = append(cmds, llmCmd, m.spinner.Tick)
+					cmds = append(cmds, llmCmd)
 					return m, tea.Batch(cmds...)
 				}
 			case "shift+enter", "alt+enter":
@@ -407,7 +409,6 @@ var (
 	inputStyle  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("63")).Padding(0, 1)
 	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).MarginBottom(1)
 
-	// Custom cursor renderer
 	cursorBgStyle = lipgloss.NewStyle().Background(lipgloss.Color("212")).Foreground(lipgloss.Color("232"))
 	cursorBlock   = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Render("█")
 )
@@ -415,7 +416,8 @@ var (
 func (m appModel) renderNormal() string {
 	activeMCPs := m.getActiveMCPs()
 
-	statusText := fmt.Sprintf(" Model: %s | Prompt: %s | MCP: %d active | (ctrl+p) menu | (esc esc) cancel", m.activeModel, m.activeSys, len(activeMCPs))
+	statusText := fmt.Sprintf(" Model: %s | Prompt: %s | MCP: %d active | Mem: %d items | (esc esc) cancel",
+		m.activeModel, m.activeSys, len(activeMCPs), len(m.memoryStore.store))
 
 	// Prepend the spinner to the status bar if loading
 	if m.isLoading {
@@ -462,9 +464,6 @@ func (m appModel) renderNormal() string {
 		} else {
 			sb.WriteString(fmt.Sprintf("**✨ Assistant:**\n%s\n\n", item.Content))
 		}
-	}
-	if m.isLoading {
-		sb.WriteString("**✨ Assistant:**\n*Generating response...*\n")
 	}
 
 	// Render Markdown via Glamour
@@ -589,6 +588,7 @@ func (m *appModel) handleMenuSelection() (tea.Model, tea.Cmd) {
 			m.input = []rune{}
 			m.cursorIdx = 0
 			m.scrollOffset = 0
+			m.memoryStore = NewMemoryStore() // reset memory
 		}
 		m.menuCursor = 0
 
@@ -662,7 +662,11 @@ func buildAssistantResponse(res *fantasy.AgentResult) string {
 	return strings.TrimSpace(sb.String())
 }
 
-// requestLLM uses charm.land/fantasy to route requests and tools
+func estimateTokens(text string) int {
+	return len(text) / 4 // 1 token ~ 4 chars
+}
+
+// requestLLM uses charm.land/fantasy to route requests and tools!
 func (m appModel) requestLLM(ctx context.Context, prompt, sysContent string, activeMCPs []string) tea.Cmd {
 	return func() tea.Msg {
 		var modelCfg *ModelConfig
@@ -710,9 +714,80 @@ func (m appModel) requestLLM(ctx context.Context, prompt, sysContent string, act
 			return llmResponseMsg{err: err}
 		}
 
+		// Sliding window for Conversation History
+		maxCtx := modelCfg.MaxContextSize
+		if maxCtx <= 0 {
+			maxCtx = 8192
+		}
+
+		// Reserve 25% of context for system prompt, generated output, and tool schemas
+		budget := int(float64(maxCtx) * 0.75)
+
+		var historyMsgs []fantasy.Message
+		currentTokens := estimateTokens(sysContent) + estimateTokens(prompt)
+
+		// Loop backwards over history. `m.history` includes the user's latest prompt as the last element.
+		// So we skip the very last element (len-1) because we'll pass it in the explicit `Prompt` field.
+		for i := len(m.history) - 2; i >= 0; i-- {
+			item := m.history[i]
+			tokens := estimateTokens(item.Content)
+
+			if currentTokens+tokens > budget {
+				break // Stop adding older messages, budget reached
+			}
+			currentTokens += tokens
+
+			role := fantasy.MessageRole("user")
+			if item.Role == "Assistant" {
+				role = fantasy.MessageRole("assistant")
+			}
+
+			historyMsgs = append(historyMsgs, fantasy.Message{
+				Role: role,
+				Content: []fantasy.MessagePart{
+					fantasy.TextPart{Text: item.Content},
+				},
+			})
+		}
+
+		// Reverse it back since we appended backwards
+		for i, j := 0, len(historyMsgs)-1; i < j; i, j = i+1, j-1 {
+			historyMsgs[i], historyMsgs[j] = historyMsgs[j], historyMsgs[i]
+		}
+
+		// Setup Tools
 		var agentTools []fantasy.AgentTool
 		var activeToolNames []string
 
+		// Add the Native Query Memory Tool
+		queryMemTool := fantasy.NewAgentTool(
+			"query_memory",
+			"Query or summarize information from a large saved memory chunk. Use this when a tool returns a 'mem_...' ID instead of actual data.",
+			func(ctx context.Context, input QueryMemoryToolInput, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+				text, exists := m.memoryStore.store[input.MemoryID]
+				if !exists {
+					return fantasy.NewTextErrorResponse(fmt.Sprintf("Memory ID %s not found", input.MemoryID)), nil
+				}
+
+				// Spawn stateless summarizer
+				queryAgent := fantasy.NewAgent(
+					langModel,
+					fantasy.WithSystemPrompt("You are a data extraction assistant. Extract information or summarize the following text according to the user's instructions. Keep your answer focused and concise."),
+				)
+
+				summaryPrompt := fmt.Sprintf("Instruction: %s\n\nData:\n%s", input.Instruction, text)
+				res, err := queryAgent.Generate(ctx, fantasy.AgentCall{Prompt: summaryPrompt})
+				if err != nil {
+					return fantasy.NewTextErrorResponse("Failed to query memory: " + err.Error()), nil
+				}
+
+				return fantasy.NewTextResponse(res.Response.Content.Text()), nil
+			},
+		)
+		agentTools = append(agentTools, queryMemTool)
+		activeToolNames = append(activeToolNames, "query_memory")
+
+		// Add Active MCP Tools
 		for _, srvName := range activeMCPs {
 			client := m.mcpManager.clients[srvName]
 			if client == nil {
@@ -723,8 +798,10 @@ func (m appModel) requestLLM(ctx context.Context, prompt, sysContent string, act
 			if err == nil {
 				for _, t := range res.Tools {
 					agentTools = append(agentTools, &MCPToolWrapper{
-						client:  client,
-						mcpTool: t,
+						client:     client,
+						mcpTool:    t,
+						memory:     m.memoryStore, // Pass the memory store to the wrapper
+						maxContext: maxCtx,
 					})
 					activeToolNames = append(activeToolNames, t.Name)
 				}
@@ -738,7 +815,8 @@ func (m appModel) requestLLM(ctx context.Context, prompt, sysContent string, act
 		)
 
 		call := fantasy.AgentCall{
-			Prompt:      prompt,
+			Prompt:      prompt,      // Explicitly set the prompt here!
+			Messages:    historyMsgs, // Appended history sliding window
 			ActiveTools: activeToolNames,
 		}
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -11,12 +13,39 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
+// Memory Store & Native Tools
+
+// MemoryStore holds large tool outputs in Go RAM so they don't blow up the LLM context.
+type MemoryStore struct {
+	store map[string]string
+}
+
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{store: make(map[string]string)}
+}
+
+func (m *MemoryStore) Save(content string) string {
+	bytes := make([]byte, 4)
+	rand.Read(bytes)
+	id := "mem_" + hex.EncodeToString(bytes)
+	m.store[id] = content
+	return id
+}
+
+// QueryMemoryToolInput defines the arguments for our native summarization tool.
+type QueryMemoryToolInput struct {
+	MemoryID    string `json:"memory_id" description:"The ID of the memory to query (e.g., mem_a1b2)"`
+	Instruction string `json:"instruction" description:"Specific instructions on what to extract or summarize from this memory"`
+}
+
 // MCP <-> Fantasy Bridge
 
 // MCPToolWrapper implements fantasy.AgentTool to bridge the AI SDK and MCP
 type MCPToolWrapper struct {
-	client  *client.Client
-	mcpTool mcp.Tool
+	client     *client.Client
+	mcpTool    mcp.Tool
+	memory     *MemoryStore
+	maxContext int
 }
 
 func (w *MCPToolWrapper) Info() fantasy.ToolInfo {
@@ -91,10 +120,29 @@ func (w *MCPToolWrapper) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 		}
 	}
 
-	if res.IsError {
-		return fantasy.NewTextErrorResponse(output.String()), nil
+	finalText := output.String()
+
+	// MEMORY INTERCEPTOR LOGIC
+	// Estimate tokens (roughly 4 chars per token).
+	// If output takes up more than 15% of the total context size, we stash it.
+	estimatedTokens := len(finalText) / 4
+	threshold := int(float64(w.maxContext) * 0.15)
+
+	if estimatedTokens > threshold && !res.IsError {
+		memID := w.memory.Save(finalText)
+		msg := fmt.Sprintf(
+			"SUCCESS: The tool executed successfully, but the output is extremely large (~%d tokens). "+
+				"To prevent context overflow, it has been saved to Go memory with ID: `%s`. "+
+				"USE THE `query_memory` TOOL to search, summarize, or extract information from this memory ID.",
+			estimatedTokens, memID,
+		)
+		return fantasy.NewTextResponse(msg), nil
 	}
-	return fantasy.NewTextResponse(output.String()), nil
+
+	if res.IsError {
+		return fantasy.NewTextErrorResponse(finalText), nil
+	}
+	return fantasy.NewTextResponse(finalText), nil
 }
 
 func (w *MCPToolWrapper) ProviderOptions() fantasy.ProviderOptions        { return nil }
