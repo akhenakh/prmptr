@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unicode"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -17,6 +18,7 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 	"charm.land/glamour/v2"
 	lipgloss "charm.land/lipgloss/v2"
+	"github.com/crawlab-team/bm25"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -67,14 +69,17 @@ type appModel struct {
 	isLoading bool
 
 	// UI Components
+	// UI Components
 	spinner      spinner.Model
 	feedbackText string
 
+	// Advanced Text Input
 	// Advanced Text Input
 	input     []rune
 	cursorIdx int
 	newPrompt []rune
 
+	// Session History & Navigation
 	// Session History & Navigation
 	history       []interaction
 	promptHistory []string
@@ -405,7 +410,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				nameStr := string(m.newPrompt)
 				if len(strings.TrimSpace(nameStr)) > 0 {
-					f, _ := os.CreateTemp("", "prmtr-*.md")
+					f, _ := os.CreateTemp("", "prmptr-*.md")
 					f.Close()
 
 					editor := os.Getenv("EDITOR")
@@ -458,9 +463,9 @@ func (m appModel) View() tea.View {
 	var v tea.View
 	v.AltScreen = true
 
-	// Restored MouseModeCellMotion to capture MouseWheel events.
-	// Users can hold 'Shift' to bypass this and use native terminal selection!
-	v.MouseMode = tea.MouseModeCellMotion
+	// Using MouseModeNone enables Native Terminal text highlighting/copying.
+	// We can still capture mouse wheels natively in most emulators with this.
+	v.MouseMode = tea.MouseModeNone
 	v.KeyboardEnhancements.ReportEventTypes = true
 
 	var ui string
@@ -530,28 +535,28 @@ func (m appModel) renderNormal() string {
 	// Build Markdown String for the entire history
 	var sb strings.Builder
 	if len(m.history) == 0 {
-		sb.WriteString("*Awaiting prompt... (Hold `Shift` to select and copy text naturally)*\n")
+		sb.WriteString("*Awaiting prompt... (You can use your mouse to select and copy text natively)*\n")
 	}
 
 	for _, item := range m.history {
 		if item.Role == "User" {
 			sb.WriteString("---\n")
-			sb.WriteString(fmt.Sprintf("**🤖 System:** *%s*\n", strings.ReplaceAll(item.System, "\n", " ")))
+			fmt.Fprintf(&sb, "**🤖 System:** *%s*\n", strings.ReplaceAll(item.System, "\n", " "))
 			if len(item.MCPs) > 0 {
-				sb.WriteString(fmt.Sprintf("**🔌 MCPs:** `%s`\n", strings.Join(item.MCPs, "`, `")))
+				fmt.Fprintf(&sb, "**🔌 MCPs:** `%s`\n", strings.Join(item.MCPs, "`, `"))
 			}
-			sb.WriteString(fmt.Sprintf("**🧠 Model:** `%s`\n\n", item.Model))
-			sb.WriteString(fmt.Sprintf("**👤 User:**\n%s\n\n", item.Text))
+			fmt.Fprintf(&sb, "**🧠 Model:** `%s`\n\n", item.Model)
+			fmt.Fprintf(&sb, "**👤 User:**\n%s\n\n", item.Text)
 		} else {
 			sb.WriteString("**✨ Assistant:**\n")
 			for _, tc := range item.ToolCalls {
-				sb.WriteString(fmt.Sprintf("> 🛠️ **Tool Call**: `%s`\n> Input: `%s`\n\n", tc.ToolName, tc.Input))
+				fmt.Fprintf(&sb, "> 🛠️ **Tool Call**: `%s`\n> Input: `%s`\n\n", tc.ToolName, tc.Input)
 			}
 			for _, tr := range item.ToolResults {
 				if textRes, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentText](tr.Result); ok {
-					formatted := formatToolResult(textRes.Text, true) // truncate for UI
-					sb.WriteString(fmt.Sprintf("> 📋 **Tool Result** (`%s`):\n", tr.ToolCallID))
-					sb.WriteString(fmt.Sprintf("> ```\n> %s\n> ```\n\n", strings.ReplaceAll(formatted, "\n", "\n> ")))
+					formatted := formatToolResult(textRes.Text, true)
+					fmt.Fprintf(&sb, "> 📋 **Tool Result** (`%s`):\n", tr.ToolCallID)
+					fmt.Fprintf(&sb, "> ```\n> %s\n> ```\n\n", strings.ReplaceAll(formatted, "\n", "\n> "))
 				}
 			}
 			if item.Text != "" {
@@ -722,7 +727,39 @@ func estimateTokens(text string) int {
 	return len(text) / 4 // 1 token ~ 4 chars
 }
 
-// smartFormat parses tool results. If it's JSON, it extracts markdown/content or prettifies.
+// chunkText splits text into sizable string chunks
+func chunkText(text string, chunkSize int) []string {
+	lines := strings.Split(text, "\n")
+	var chunks []string
+	var currentChunk strings.Builder
+
+	for _, line := range lines {
+		if currentChunk.Len()+len(line) > chunkSize && currentChunk.Len() > 0 {
+			chunks = append(chunks, currentChunk.String())
+			currentChunk.Reset()
+		}
+		currentChunk.WriteString(line)
+		currentChunk.WriteString("\n")
+	}
+	if currentChunk.Len() > 0 {
+		chunks = append(chunks, currentChunk.String())
+	}
+
+	if len(chunks) == 1 && len(chunks[0]) > chunkSize*2 {
+		var rawChunks []string
+		runes := []rune(text)
+		for i := 0; i < len(runes); i += chunkSize {
+			end := i + chunkSize
+			if end > len(runes) {
+				end = len(runes)
+			}
+			rawChunks = append(rawChunks, string(runes[i:end]))
+		}
+		return rawChunks
+	}
+	return chunks
+}
+
 func formatToolResult(input string, truncate bool) string {
 	formatted := input
 	var data map[string]any
@@ -776,16 +813,15 @@ func saveHistoryToMarkdown(history []interaction) string {
 	var sb strings.Builder
 	for _, item := range history {
 		if item.Role == "User" {
-			sb.WriteString(fmt.Sprintf("## User\n**System**: %s\n**Model**: %s\n\n%s\n\n", item.System, item.Model, item.Text))
+			fmt.Fprintf(&sb, "## User\n**System**: %s\n**Model**: %s\n\n%s\n\n", item.System, item.Model, item.Text)
 		} else {
 			sb.WriteString("## Assistant\n")
 			for _, tc := range item.ToolCalls {
-				sb.WriteString(fmt.Sprintf("\n> **Tool Call**: `%s`\n> Input: `%s`\n", tc.ToolName, tc.Input))
+				fmt.Fprintf(&sb, "\n> **Tool Call**: `%s`\n> Input: `%s`\n", tc.ToolName, tc.Input)
 			}
 			for _, tr := range item.ToolResults {
 				if textRes, ok := fantasy.AsToolResultOutputType[fantasy.ToolResultOutputContentText](tr.Result); ok {
-					// Pass false to ensure we DO NOT truncate the file
-					sb.WriteString(fmt.Sprintf("\n> **Tool Result** (`%s`):\n\n%s\n\n", tr.ToolCallID, formatToolResult(textRes.Text, false)))
+					fmt.Fprintf(&sb, "\n> **Tool Result** (`%s`):\n\n%s\n\n", tr.ToolCallID, formatToolResult(textRes.Text, false))
 				}
 			}
 			sb.WriteString(item.Text + "\n\n")
@@ -903,6 +939,7 @@ func (m appModel) startLLMStream(ctx context.Context, prompt, sysContent string,
 	var agentTools []fantasy.AgentTool
 	var activeToolNames []string
 
+	// Create BM25-backed memory query tool
 	queryMemTool := fantasy.NewAgentTool(
 		"query_memory",
 		"Query or summarize information from a large saved memory chunk. Use this when a tool returns a 'mem_...' ID instead of actual data.",
@@ -910,6 +947,43 @@ func (m appModel) startLLMStream(ctx context.Context, prompt, sysContent string,
 			text, exists := m.memoryStore.store[input.MemoryID]
 			if !exists {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("Memory ID %s not found", input.MemoryID)), nil
+			}
+
+			usedBM25 := false
+			summaryBudget := int(float64(maxCtx) * 0.7)
+
+			// RAG / BM25 Logic
+			if estimateTokens(text) > summaryBudget {
+				chunks := chunkText(text, 2000)
+				tokenizer := func(s string) []string {
+					f := func(c rune) bool { return !unicode.IsLetter(c) && !unicode.IsNumber(c) }
+					return strings.FieldsFunc(strings.ToLower(s), f)
+				}
+
+				qTokens := tokenizer(input.Instruction)
+				if len(qTokens) > 0 {
+					b, err := bm25.NewBM25Okapi(chunks, tokenizer, 1.5, 0.75, nil)
+					if err == nil {
+						nChunks := summaryBudget / 500
+						if nChunks < 1 {
+							nChunks = 1
+						}
+						if nChunks > len(chunks) {
+							nChunks = len(chunks)
+						}
+
+						topChunks, err := b.GetTopN(qTokens, nChunks)
+						if err == nil && len(topChunks) > 0 {
+							text = strings.Join(topChunks, "\n\n...[SNIP]...\n\n")
+							usedBM25 = true
+						}
+					}
+				} else {
+					maxChars := summaryBudget * 4
+					if len(text) > maxChars {
+						text = text[:maxChars] + "\n...[TRUNCATED]..."
+					}
+				}
 			}
 
 			queryAgent := fantasy.NewAgent(
@@ -923,7 +997,12 @@ func (m appModel) startLLMStream(ctx context.Context, prompt, sysContent string,
 				return fantasy.NewTextErrorResponse("Failed to query memory: " + err.Error()), nil
 			}
 
-			return fantasy.NewTextResponse(res.Response.Content.Text()), nil
+			finalRes := res.Response.Content.Text()
+			if usedBM25 {
+				finalRes = "⚠️ **WARNING:** The original memory was too large. BM25 retrieval was used to select relevant parts before summarization. Some details may have been missed.\n\n" + finalRes
+			}
+
+			return fantasy.NewTextResponse(finalRes), nil
 		},
 	)
 	agentTools = append(agentTools, queryMemTool)

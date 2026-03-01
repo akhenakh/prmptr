@@ -1,4 +1,4 @@
-module github.com/akhenakh/prmtr
+module github.com/akhenakh/prmptr
 
 go 1.26.0
 
@@ -8,6 +8,7 @@ require (
 	charm.land/fantasy v0.11.0
 	charm.land/glamour/v2 v2.0.0-20260226140904-e36ae5e1858e
 	charm.land/lipgloss/v2 v2.0.0
+	github.com/crawlab-team/bm25 v0.0.0-20250328025100-5014dda86138
 	github.com/mark3labs/mcp-go v0.44.0
 	gopkg.in/yaml.v3 v3.0.1
 )

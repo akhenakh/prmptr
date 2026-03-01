@@ -69,7 +69,7 @@ func main() {
 
 	p := tea.NewProgram(initialModel(cfg))
 	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error running prmtr: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error running prmptr: %v\n", err)
 		os.Exit(1)
 	}
 }

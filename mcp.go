@@ -36,9 +36,7 @@ type QueryMemoryToolInput struct {
 	Instruction string `json:"instruction" description:"Specific instructions on what to extract or summarize from this memory"`
 }
 
-// -------------------------------------------------------------------------
 // MCP <-> Fantasy Bridge
-// -------------------------------------------------------------------------
 
 // MCPToolWrapper implements fantasy.AgentTool to bridge the AI SDK and MCP
 type MCPToolWrapper struct {
@@ -116,7 +114,7 @@ func (w *MCPToolWrapper) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 			output.WriteString(c.Text)
 			output.WriteString("\n")
 		default:
-			output.WriteString(fmt.Sprintf("%v\n", c))
+			fmt.Fprintf(&output, "%v\n", c)
 		}
 	}
 
@@ -124,9 +122,9 @@ func (w *MCPToolWrapper) Run(ctx context.Context, call fantasy.ToolCall) (fantas
 
 	// MEMORY INTERCEPTOR LOGIC
 	// Estimate tokens (roughly 4 chars per token).
-	// If output takes up more than 15% of the total context size, we stash it.
+	// If output takes up more than 40% of the total context size, we stash it.
 	estimatedTokens := len(finalText) / 4
-	threshold := int(float64(w.maxContext) * 0.15)
+	threshold := int(float64(w.maxContext) * 0.40)
 
 	if estimatedTokens > threshold && !res.IsError {
 		memID := w.memory.Save(finalText)
