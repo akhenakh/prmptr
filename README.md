@@ -2,6 +2,8 @@
 
 A highly flexible, terminal-based LLM client designed for rapid iteration, prompt engineering, and deep debugging of the Model Context Protocol (MCP).
 
+![pmrptr](./img/prmptr.jpg)
+
 ## Why prmptr?
 
 `prmptr` was build out of frustration. Most terminal AI clients and RAG frameworks are heavily oriented towards autonomous software development (coding agents). They make it surprisingly tedious to do simple things like switch to a different model, swap out a system prompt, or dynamically toggle MCP tools on and off. 
@@ -18,8 +20,6 @@ A highly flexible, terminal-based LLM client designed for rapid iteration, promp
 
 
 ## Install
-
-Make sure you have Go 1.24+ installed. Clone the repository and build:
 
 ```bash
 go install github.com/akhenakh/prmptr@latest
