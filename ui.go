@@ -69,17 +69,14 @@ type appModel struct {
 	isLoading bool
 
 	// UI Components
-	// UI Components
 	spinner      spinner.Model
 	feedbackText string
 
-	// Advanced Text Input
 	// Advanced Text Input
 	input     []rune
 	cursorIdx int
 	newPrompt []rune
 
-	// Session History & Navigation
 	// Session History & Navigation
 	history       []interaction
 	promptHistory []string
@@ -100,6 +97,9 @@ type appModel struct {
 	// Menus
 	menuCursor int
 	menuItems  []string
+
+	// Cache
+	glamourRenderer *glamour.TermRenderer
 }
 
 func initialModel(cfg *Config) appModel {
@@ -172,42 +172,70 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
-	// Streaming Handlers
-	case streamTextMsg:
-		if len(m.history) > 0 {
-			lastIdx := len(m.history) - 1
-			m.history[lastIdx].Text += string(msg)
-			m.scrollOffset = 0 // Force snap to bottom during stream
+		// Initialize or update the renderer when window size changes
+		width := m.width - 4
+		if width < 10 {
+			width = 80 // fallback
 		}
-		cmds = append(cmds, waitForStream(m.streamChan))
+		m.glamourRenderer, _ = glamour.NewTermRenderer(
+			glamour.WithStandardStyle("dark"),
+			glamour.WithWordWrap(width),
+		)
 
-	case streamToolCallMsg:
-		if len(m.history) > 0 {
+	// Streaming Handlers (Batched)
+	case streamTextMsg, streamToolCallMsg, streamToolResultMsg, streamErrMsg, streamDoneMsg:
+		processMsg := func(mMsg tea.Msg) {
+			if len(m.history) == 0 {
+				if errMsg, ok := mMsg.(streamErrMsg); ok {
+					m.isLoading = false
+					m.cancelGen = nil
+					m.feedbackText = fmt.Sprintf("Error: %v", error(errMsg))
+				} else if _, ok := mMsg.(streamDoneMsg); ok {
+					m.isLoading = false
+					m.cancelGen = nil
+				}
+				return
+			}
+
 			lastIdx := len(m.history) - 1
-			m.history[lastIdx].ToolCalls = append(m.history[lastIdx].ToolCalls, fantasy.ToolCallContent(msg))
-			m.scrollOffset = 0
+			switch nmsg := mMsg.(type) {
+			case streamTextMsg:
+				m.history[lastIdx].Text += string(nmsg)
+				m.scrollOffset = 0
+			case streamToolCallMsg:
+				m.history[lastIdx].ToolCalls = append(m.history[lastIdx].ToolCalls, fantasy.ToolCallContent(nmsg))
+				m.scrollOffset = 0
+			case streamToolResultMsg:
+				m.history[lastIdx].ToolResults = append(m.history[lastIdx].ToolResults, fantasy.ToolResultContent(nmsg))
+				m.scrollOffset = 0
+			case streamErrMsg:
+				m.isLoading = false
+				m.cancelGen = nil
+				m.history[lastIdx].Text += fmt.Sprintf("\n\n**Error:** %v", error(nmsg))
+			case streamDoneMsg:
+				m.isLoading = false
+				m.cancelGen = nil
+			}
 		}
-		cmds = append(cmds, waitForStream(m.streamChan))
 
-	case streamToolResultMsg:
-		if len(m.history) > 0 {
-			lastIdx := len(m.history) - 1
-			m.history[lastIdx].ToolResults = append(m.history[lastIdx].ToolResults, fantasy.ToolResultContent(msg))
-			m.scrollOffset = 0
-		}
-		cmds = append(cmds, waitForStream(m.streamChan))
+		// Process the event that woke us up
+		processMsg(msg)
 
-	case streamErrMsg:
-		m.isLoading = false
-		m.cancelGen = nil
-		if len(m.history) > 0 {
-			lastIdx := len(m.history) - 1
-			m.history[lastIdx].Text += fmt.Sprintf("\n\n**Error:** %v", error(msg))
+		// Drain any queued events from the channel synchronously
+		// to batch updates and drastically reduce UI render cycles
+		for draining := true; draining; {
+			select {
+			case nextMsg := <-m.streamChan:
+				processMsg(nextMsg)
+			default:
+				draining = false
+			}
 		}
 
-	case streamDoneMsg:
-		m.isLoading = false
-		m.cancelGen = nil
+		// Only wait for more chunks if the stream hasn't finished
+		if m.isLoading {
+			cmds = append(cmds, waitForStream(m.streamChan))
+		}
 
 	case feedbackMsg:
 		m.feedbackText = ""
@@ -565,10 +593,21 @@ func (m appModel) renderNormal() string {
 		}
 	}
 
-	r, _ := glamour.NewTermRenderer(
-		glamour.WithStandardStyle("dark"),
-		glamour.WithWordWrap(m.width-4),
-	)
+	var r *glamour.TermRenderer
+	if m.glamourRenderer != nil {
+		r = m.glamourRenderer
+	} else {
+		// Fallback in case View is called before the first WindowSizeMsg
+		width := m.width - 4
+		if width < 10 {
+			width = 80
+		}
+		r, _ = glamour.NewTermRenderer(
+			glamour.WithStandardStyle("dark"),
+			glamour.WithWordWrap(width),
+		)
+	}
+
 	rendered, _ := r.Render(sb.String())
 
 	lines := strings.Split(rendered, "\n")
