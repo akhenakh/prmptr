@@ -271,6 +271,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	// Keyboard Support
+	// Keyboard Support
 	case tea.KeyPressMsg:
 		// Global Quit
 		if msg.String() == "ctrl+c" {
@@ -282,16 +283,24 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Double ESC to cancel generation or clear input
 			if now.Sub(m.lastEsc) < 500*time.Millisecond {
 				if m.cancelGen != nil {
+					// We are currently generating. Signal the LLM to stop.
 					m.cancelGen()
 					m.cancelGen = nil
-					m.isLoading = false
+
+					// IMPORTANT: Do NOT manually set m.isLoading = false here!
+					// We let the background goroutine naturally catch the cancellation
+					// and send a `streamDoneMsg` through the channel. This guarantees
+					// the channel is fully drained so the next session isn't poisoned.
+
 					if len(m.history) > 0 {
 						m.history[len(m.history)-1].Text += "\n\n*Cancelled by user.*"
 					}
+				} else {
+					// If we are NOT generating, double ESC simply clears the input text
+					m.input = []rune{}
+					m.cursorIdx = 0
+					m.scrollOffset = 0
 				}
-				m.input = []rune{}
-				m.cursorIdx = 0
-				m.scrollOffset = 0
 			}
 			m.state = StateNormal
 			m.lastEsc = now
