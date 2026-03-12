@@ -52,6 +52,12 @@ mcp_servers:
       - "-y"
       - "@modelcontextprotocol/server-filesystem"
       - "/tmp"
+  - name: "remote_server"
+    type: "sse"
+    url: "http://localhost:8080/sse"
+  - name: "streamable_server"
+    type: "streamable"
+    url: "http://localhost:8081/mcp"
 
 system_prompts:
   - name: "default"

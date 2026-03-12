@@ -29,7 +29,7 @@ type ModelConfig struct {
 
 type MCPServerConfig struct {
 	Name    string   `yaml:"name"`
-	Type    string   `yaml:"type"` // "stdio" or "sse"
+	Type    string   `yaml:"type"` // "stdio", "sse", or "streamable"
 	Command string   `yaml:"command,omitempty"`
 	Args    []string `yaml:"args,omitempty"`
 	URL     string   `yaml:"url,omitempty"`

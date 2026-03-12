@@ -180,6 +180,11 @@ func NewMCPManager(servers []MCPServerConfig) *MCPManager {
 			if err == nil {
 				err = c.Start(ctx)
 			}
+		case "streamable":
+			c, err = client.NewStreamableHttpClient(srv.URL)
+			if err == nil {
+				err = c.Start(ctx)
+			}
 		default:
 			continue
 		}
